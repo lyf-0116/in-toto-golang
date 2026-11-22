@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -1156,4 +1157,137 @@ func TestLoadLayoutCertificates(t *testing.T) {
 	testLayout.IntermediateCas[intermediateKey.KeyID] = intermediateKey
 	_, _, err = LoadLayoutCertificates(testLayout, [][]byte{[]byte("123123123")})
 	assert.NotNil(t, err, "expected error with invalid extra intermediates")
+}
+
+func TestVerifyInspectionRunDir(t *testing.T) {
+	// A non-empty writable directory passes the default (non-empty-required)
+	// checks. The test working directory contains the copied test data.
+	if err := verifyInspectionRunDir(".", false); err != nil {
+		t.Errorf("verifyInspectionRunDir on cwd returned %s, expected nil", err)
+	}
+
+	// A non-existent path must be rejected.
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	if err := verifyInspectionRunDir(missing, false); err == nil {
+		t.Errorf("verifyInspectionRunDir accepted a non-existent path")
+	}
+
+	// A symbolic link must be rejected, even if it points to a valid
+	// writable directory.
+	target := t.TempDir()
+	symlink := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, symlink); err != nil {
+		if testOSisWindows() {
+			t.Skip("creating symbolic links is not supported in this environment")
+		}
+		t.Fatal(err)
+	}
+	err := verifyInspectionRunDir(symlink, false)
+	if !errors.Is(err, ErrInspectionRunDirIsSymlink) {
+		t.Errorf("verifyInspectionRunDir on symlink returned %s, expected %s",
+			err, ErrInspectionRunDirIsSymlink)
+	}
+
+	// A regular file is not a valid run directory.
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyInspectionRunDir(file, false); err == nil {
+		t.Errorf("verifyInspectionRunDir accepted a regular file as directory")
+	}
+
+	// An empty directory is rejected when emptiness is not allowed.
+	emptyDir := t.TempDir()
+	if err := verifyInspectionRunDir(emptyDir, true); err == nil {
+		t.Errorf("verifyInspectionRunDir accepted an empty directory")
+	}
+
+	// The same empty directory passes when emptiness is allowed.
+	if err := verifyInspectionRunDir(emptyDir, false); err != nil {
+		t.Errorf("verifyInspectionRunDir on empty dir returned %s, expected nil", err)
+	}
+
+	// A non-empty directory passes when emptiness is not allowed.
+	nonEmptyDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(nonEmptyDir, "child"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyInspectionRunDir(nonEmptyDir, true); err != nil {
+		t.Errorf("verifyInspectionRunDir on non-empty dir returned %s, expected nil", err)
+	}
+}
+
+func TestRunInspectionsWritesLinksToRunDir(t *testing.T) {
+	mb, err := LoadMetadata("demo.layout")
+	if err != nil {
+		t.Fatalf("unable to parse layout file: %s", err)
+	}
+	layout, ok := mb.GetPayload().(Layout)
+	if !ok {
+		t.Fatalf("invalid metadata")
+	}
+	layout.Inspect = []Inspection{
+		{
+			SupplyChainItem: SupplyChainItem{Name: "foo"},
+			Run:             []string{"sh", "-c", "true"},
+		},
+	}
+
+	runDir := t.TempDir()
+	result, err := RunInspections(layout, runDir, testOSisWindows(), false)
+	if err != nil {
+		t.Fatalf("RunInspections returned %s, expected nil", err)
+	}
+	if _, ok := result["foo"]; !ok {
+		t.Fatalf("RunInspections did not return metadata for inspection 'foo'")
+	}
+
+	// The generated link must be written into the run directory rather than
+	// the current working directory.
+	linkPath := filepath.Join(runDir, "foo.link")
+	if _, err := os.Stat(linkPath); err != nil {
+		t.Errorf("expected inspection link at %s: %s", linkPath, err)
+	}
+	if _, err := os.Stat("foo.link"); !os.IsNotExist(err) {
+		t.Errorf("inspection link must not be written to the current working directory")
+	}
+}
+
+func TestRunInspectionsDumpFailure(t *testing.T) {
+	if testOSisWindows() {
+		t.Skip("permission based write failure test is not reliable on Windows")
+	}
+
+	mb, err := LoadMetadata("demo.layout")
+	if err != nil {
+		t.Fatalf("unable to parse layout file: %s", err)
+	}
+	layout, ok := mb.GetPayload().(Layout)
+	if !ok {
+		t.Fatalf("invalid metadata")
+	}
+	layout.Inspect = []Inspection{
+		{
+			SupplyChainItem: SupplyChainItem{Name: "foo"},
+			Run:             []string{"sh", "-c", "true"},
+		},
+	}
+
+	// A non-writable directory passes the upfront checks elsewhere but makes
+	// the inspection link dump fail. RunInspections must surface that error
+	// instead of only printing it.
+	runDir := t.TempDir()
+	if err := os.Chmod(runDir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(runDir, 0755)
+
+	result, err := RunInspections(layout, runDir, testOSisWindows(), false)
+	if err == nil {
+		t.Fatalf("RunInspections should fail when the inspection link cannot be written")
+	}
+	if result != nil {
+		t.Errorf("RunInspections returned %v on dump failure, expected nil", result)
+	}
 }

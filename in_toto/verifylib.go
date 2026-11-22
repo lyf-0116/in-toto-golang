@@ -24,6 +24,59 @@ var ErrInspectionRunDirIsSymlink = errors.New("runDir is a symlink. This is a se
 
 var ErrNotLayout = errors.New("verification workflow passed a non-layout")
 
+// verifyInspectionRunDir performs sanity checks on the directory from which
+// inspection commands are executed and into which the generated unsigned
+// inspection links are written. When requireEmpty is true the directory must
+// be empty, so that pre-existing files cannot be overwritten or accidentally
+// treated as inspection artifacts. The directory must exist, must not be a
+// symbolic link (which could point outside of the intended root) and must be a
+// writable directory.
+func verifyInspectionRunDir(runDir string, requireEmpty bool) error {
+	// Check if the path exists. Lstat is used so that a symbolic link is
+	// reported as such instead of being silently followed.
+	info, err := os.Lstat(runDir)
+	if err != nil {
+		return err
+	}
+
+	// Check if runDir itself is a symlink
+	if info.Mode()&os.ModeSymlink == os.ModeSymlink {
+		return ErrInspectionRunDirIsSymlink
+	}
+
+	// Check if runDir is a directory
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", runDir)
+	}
+
+	// Check if runDir is writable
+	if err := isWritable(runDir); err != nil {
+		return err
+	}
+
+	if !requireEmpty {
+		return nil
+	}
+
+	// Check if runDir is empty (we do not want to overwrite files).
+	// We use File.Readdirnames for this action.
+	f, err := os.Open(runDir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// We use Readdirnames(1) for performance reasons, one child node
+	// is enough to prove that the directory is not empty.
+	if _, err := f.Readdirnames(1); err == io.EOF {
+		return fmt.Errorf("inspection run directory %s is empty: %w",
+			runDir, err)
+	} else if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 /*
 RunInspections iteratively executes the command in the Run field of all
 inspections of the passed layout, creating unsigned link metadata that records
@@ -45,12 +98,16 @@ second return value is the error.
 func RunInspections(layout Layout, runDir string, lineNormalization bool, useDSSE bool) (map[string]Metadata, error) {
 	inspectionMetadata := make(map[string]Metadata)
 
+	// An empty runDir means the current working directory, matching the
+	// semantics of exec.Cmd and the artifact recording paths below.
+	effectiveRunDir := runDir
+	if effectiveRunDir == "" {
+		effectiveRunDir = "."
+	}
+
 	for _, inspection := range layout.Inspect {
 
-		paths := []string{"."}
-		if runDir != "" {
-			paths = []string{runDir}
-		}
+		paths := []string{effectiveRunDir}
 
 		linkEnv, err := InTotoRun(inspection.Name, runDir, paths, paths,
 			inspection.Run, Key{}, []string{"sha256"}, nil, nil, lineNormalization, false, useDSSE)
@@ -70,10 +127,13 @@ func RunInspections(layout Layout, runDir string, lineNormalization bool, useDSS
 				retVal)
 		}
 
-		// Dump inspection link to cwd using the short link name format
+		// Dump inspection link to the inspection run directory using the
+		// short link name format. A write failure must abort verification
+		// instead of being silently ignored.
 		linkName := fmt.Sprintf(LinkNameFormatShort, inspection.Name)
-		if err := linkEnv.Dump(linkName); err != nil {
-			fmt.Printf("JSON serialization or writing failed: %s", err)
+		if err := linkEnv.Dump(filepath.Join(effectiveRunDir, linkName)); err != nil {
+			return nil, fmt.Errorf("failed to write inspection link %s: %w",
+				linkName, err)
 		}
 
 		inspectionMetadata[inspection.Name] = linkEnv
@@ -912,6 +972,16 @@ func InTotoVerify(layoutEnv Metadata, layoutKeys map[string]Key,
 	linkDir string, stepName string, parameterDictionary map[string]string, intermediatePems [][]byte, lineNormalization bool) (
 	Metadata, error) {
 
+	// Inspections are executed in the current working directory unless an
+	// explicit run directory is provided via InTotoVerifyWithDirectory.
+	// Apply the same sanity checks as there, but do not require the directory
+	// to be empty to preserve the historical behavior of running against the
+	// current working directory.
+	runDir := "."
+	if err := verifyInspectionRunDir(runDir, false); err != nil {
+		return nil, err
+	}
+
 	// Verify root signatures
 	if err := VerifyLayoutSignatures(layoutEnv, layoutKeys); err != nil {
 		return nil, err
@@ -983,7 +1053,7 @@ func InTotoVerify(layoutEnv Metadata, layoutKeys map[string]Key,
 		return nil, err
 	}
 
-	inspectionMetadata, err := RunInspections(layout, "", lineNormalization, useDSSE)
+	inspectionMetadata, err := RunInspections(layout, runDir, lineNormalization, useDSSE)
 	if err != nil {
 		return nil, err
 	}
@@ -1015,40 +1085,12 @@ func InTotoVerifyWithDirectory(layoutEnv Metadata, layoutKeys map[string]Key,
 	linkDir string, runDir string, stepName string, parameterDictionary map[string]string, intermediatePems [][]byte, lineNormalization bool) (
 	Metadata, error) {
 
-	// runDir sanity checks
-	// check if path exists
-	info, err := os.Stat(runDir)
-	if err != nil {
-		return nil, err
-	}
+	var err error
 
-	// check if runDir is a symlink
-	if info.Mode()&os.ModeSymlink == os.ModeSymlink {
-		return nil, ErrInspectionRunDirIsSymlink
-	}
-
-	// check if runDir is writable and a directory
-	err = isWritable(runDir)
-	if err != nil {
-		return nil, err
-	}
-
-	// check if runDir is empty (we do not want to overwrite files)
-	// We abuse File.Readdirnames for this action.
-	f, err := os.Open(runDir)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	// We use Readdirnames(1) for performance reasons, one child node
-	// is enough to proof that the directory is not empty
-	_, err = f.Readdirnames(1)
-	// if io.EOF gets returned as error the directory is empty
-	if err == io.EOF {
-		return nil, err
-	}
-	err = f.Close()
-	if err != nil {
+	// runDir sanity checks: the explicitly passed directory must exist, not
+	// be a symlink, be writable and be empty (we do not want to overwrite
+	// files or hash pre-existing files as inspection artifacts).
+	if err := verifyInspectionRunDir(runDir, true); err != nil {
 		return nil, err
 	}
 
