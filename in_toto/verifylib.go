@@ -560,13 +560,13 @@ func VerifyLinkSignatureThesholds(layout Layout,
 		// authorized, the layout contains a verification key and the signature
 		// verification passes.  Only good links are stored, to verify thresholds
 		// below.
-		isAuthorizedSignature := false
 		for signerKeyID, linkEnv := range linksPerStep {
+			isAuthorizedSignature := false
 			for _, authorizedKeyID := range step.PubKeys {
 				if signerKeyID == authorizedKeyID {
 					if verifierKey, ok := layout.Keys[authorizedKeyID]; ok {
 						if err := linkEnv.VerifySignature(verifierKey); err == nil {
-							linksPerStepVerified[signerKeyID] = linkEnv
+							linksPerStepVerified[verifierKey.KeyID] = linkEnv
 							isAuthorizedSignature = true
 							break
 						}
@@ -602,7 +602,7 @@ func VerifyLinkSignatureThesholds(layout Layout,
 					continue
 				}
 
-				linksPerStepVerified[signerKeyID] = linkEnv
+				linksPerStepVerified[cert.KeyID] = linkEnv
 			}
 		}
 
