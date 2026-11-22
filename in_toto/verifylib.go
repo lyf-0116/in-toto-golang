@@ -803,8 +803,6 @@ func VerifySublayouts(layout Layout,
 	return stepsMetadataVerified, nil
 }
 
-// TODO: find a better way than two helper functions for the replacer op
-
 func substituteParamatersInSlice(replacer *strings.Replacer, slice []string) []string {
 	newSlice := make([]string, 0)
 	for _, item := range slice {
@@ -813,14 +811,117 @@ func substituteParamatersInSlice(replacer *strings.Replacer, slice []string) []s
 	return newSlice
 }
 
-func substituteParametersInSliceOfSlices(replacer *strings.Replacer,
-	slice [][]string) [][]string {
-	newSlice := make([][]string, 0)
-	for _, item := range slice {
-		newSlice = append(newSlice, substituteParamatersInSlice(replacer,
-			item))
+/*
+validateArtifactRuleParameterValue checks a parameter value that is
+substituted into an artifact rule (Expected Materials or Expected Products).
+The value becomes part of a security critical rule pattern, so it must not
+contain glob wildcards, which would silently widen the pattern and flatten
+rule specificity, nor parent directory references, which survive path
+cleaning and could match artifacts outside the intended prefix.  Slashes,
+dots and brackets remain allowed, as they legitimately appear in file names.
+*/
+func validateArtifactRuleParameterValue(parameter, value string) error {
+	if strings.ContainsAny(value, "*?") {
+		return fmt.Errorf("invalid value for parameter '%s': wildcards are"+
+			" not allowed in artifact rules", parameter)
 	}
-	return newSlice
+	for _, segment := range strings.Split(value, "/") {
+		if segment == ".." {
+			return fmt.Errorf("invalid value for parameter '%s': parent"+
+				" directory references are not allowed in artifact rules",
+				parameter)
+		}
+	}
+	return nil
+}
+
+/*
+artifactRulesContainMarker reports whether any token of the passed artifact
+rules contains the passed substitution marker.
+*/
+func artifactRulesContainMarker(rules [][]string, marker string) bool {
+	for _, rule := range rules {
+		for _, token := range rule {
+			if strings.Contains(token, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+/*
+parameterUsedInArtifactRules reports whether the substitution marker for the
+passed parameter appears in any artifact rule of the passed layout.
+*/
+func parameterUsedInArtifactRules(layout Layout, marker string) bool {
+	for _, step := range layout.Steps {
+		if artifactRulesContainMarker(step.ExpectedMaterials, marker) ||
+			artifactRulesContainMarker(step.ExpectedProducts, marker) {
+			return true
+		}
+	}
+	for _, inspection := range layout.Inspect {
+		if artifactRulesContainMarker(inspection.ExpectedMaterials, marker) ||
+			artifactRulesContainMarker(inspection.ExpectedProducts, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+substituteParametersInRules performs parameter substitution on the passed
+artifact rules and re-validates each rule the substitution changed: the
+number of rule tokens must remain the same and the rule must still conform
+with the available rule formats, ensuring the substitution did not rewrite
+the rule's pattern or structure.
+*/
+func substituteParametersInRules(replacer *strings.Replacer,
+	rules [][]string) ([][]string, error) {
+	newRules := make([][]string, 0, len(rules))
+	for _, rule := range rules {
+		newRule := substituteParamatersInSlice(replacer, rule)
+		if len(rule) > 0 && !reflect.DeepEqual(newRule, rule) {
+			if len(newRule) != len(rule) {
+				return nil, fmt.Errorf("parameter substitution changed the"+
+					" structure of artifact rule '%s'",
+					strings.Join(rule, " "))
+			}
+			if err := validateArtifactRule(newRule); err != nil {
+				return nil, fmt.Errorf("parameter substitution resulted in"+
+					" invalid artifact rule: %s", err)
+			}
+		}
+		newRules = append(newRules, newRule)
+	}
+	return newRules, nil
+}
+
+/*
+substituteParametersInCommand performs parameter substitution on the passed
+command.  If the command is executed during verification (the Run field of
+inspections) and substitution affected its first token, the substituted
+program is re-validated: it must not be empty and must not reference a
+parent directory, as it is the program executed by the verifier.
+*/
+func substituteParametersInCommand(replacer *strings.Replacer,
+	command []string, executed bool) ([]string, error) {
+	newCommand := substituteParamatersInSlice(replacer, command)
+	if executed && len(command) > 0 && len(newCommand) > 0 &&
+		newCommand[0] != command[0] {
+		if strings.TrimSpace(newCommand[0]) == "" {
+			return nil, fmt.Errorf("parameter substitution resulted in an" +
+				" empty inspection command")
+		}
+		if cleaned := path.Clean(newCommand[0]); cleaned == ".." ||
+			strings.HasPrefix(cleaned, "../") {
+			return nil, fmt.Errorf("parameter substitution resulted in"+
+				" inspection command '%s' outside the run directory",
+				newCommand[0])
+		}
+	}
+	return newCommand, nil
 }
 
 /*
@@ -832,6 +933,13 @@ in the following fields:
 The substitution marker is '{}' and the keyword within the braces is replaced
 by a value found in the substitution map passed, parameterDictionary. The
 layout with parameters substituted is returned to the calling function.
+
+Parameter values are validated against the domain of the fields that consume
+them.  Values substituted into artifact rules must not contain wildcards or
+parent directory references, while values substituted into commands may
+contain spaces and arbitrary paths.  After substitution, changed artifact
+rules are re-parsed to confirm their pattern and structure were not rewritten,
+and a substituted program of an executed inspection command is re-validated.
 */
 func SubstituteParameters(layout Layout,
 	parameterDictionary map[string]string) (Layout, error) {
@@ -850,30 +958,57 @@ func SubstituteParameters(layout Layout,
 			return layout, fmt.Errorf("invalid format for parameter")
 		}
 
+		if parameterUsedInArtifactRules(layout, "{"+parameter+"}") {
+			if err := validateArtifactRuleParameterValue(parameter,
+				value); err != nil {
+				return layout, err
+			}
+		}
+
 		parameters = append(parameters, "{"+parameter+"}")
 		parameters = append(parameters, value)
 	}
 
 	replacer := strings.NewReplacer(parameters...)
 
+	var err error
+
 	for i := range layout.Steps {
-		layout.Steps[i].ExpectedMaterials = substituteParametersInSliceOfSlices(
+		layout.Steps[i].ExpectedMaterials, err = substituteParametersInRules(
 			replacer, layout.Steps[i].ExpectedMaterials)
-		layout.Steps[i].ExpectedProducts = substituteParametersInSliceOfSlices(
+		if err != nil {
+			return layout, err
+		}
+		layout.Steps[i].ExpectedProducts, err = substituteParametersInRules(
 			replacer, layout.Steps[i].ExpectedProducts)
-		layout.Steps[i].ExpectedCommand = substituteParamatersInSlice(replacer,
-			layout.Steps[i].ExpectedCommand)
+		if err != nil {
+			return layout, err
+		}
+		layout.Steps[i].ExpectedCommand, err = substituteParametersInCommand(
+			replacer, layout.Steps[i].ExpectedCommand, false)
+		if err != nil {
+			return layout, err
+		}
 	}
 
 	for i := range layout.Inspect {
-		layout.Inspect[i].ExpectedMaterials =
-			substituteParametersInSliceOfSlices(replacer,
+		layout.Inspect[i].ExpectedMaterials, err =
+			substituteParametersInRules(replacer,
 				layout.Inspect[i].ExpectedMaterials)
-		layout.Inspect[i].ExpectedProducts =
-			substituteParametersInSliceOfSlices(replacer,
+		if err != nil {
+			return layout, err
+		}
+		layout.Inspect[i].ExpectedProducts, err =
+			substituteParametersInRules(replacer,
 				layout.Inspect[i].ExpectedProducts)
-		layout.Inspect[i].Run = substituteParamatersInSlice(replacer,
-			layout.Inspect[i].Run)
+		if err != nil {
+			return layout, err
+		}
+		layout.Inspect[i].Run, err = substituteParametersInCommand(replacer,
+			layout.Inspect[i].Run, true)
+		if err != nil {
+			return layout, err
+		}
 	}
 
 	return layout, nil

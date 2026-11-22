@@ -1082,6 +1082,96 @@ func TestSubstituteParamaters(t *testing.T) {
 	}
 }
 
+func TestSubstituteParametersValidation(t *testing.T) {
+	// NOTE: SubstituteParameters mutates the passed layout's items, so each
+	// substitution needs a fresh layout.
+	makeLayout := func() Layout {
+		return Layout{
+			Type: "_layout",
+			Inspect: []Inspection{
+				{
+					SupplyChainItem: SupplyChainItem{
+						Name: "verify-the-thing",
+						ExpectedMaterials: [][]string{{"MATCH", "{SOURCE_THING}",
+							"WITH", "MATERIALS", "FROM", "{SOURCE_STEP}"}},
+						ExpectedProducts: [][]string{{"CREATE", "{NEW_THING}"}},
+					},
+					Run: []string{"{UNTAR}", "xzf", "foo.tar.gz"},
+				},
+			},
+			Steps: []Step{
+				{
+					SupplyChainItem: SupplyChainItem{
+						Name: "run-command",
+						ExpectedMaterials: [][]string{{"MATCH", "{SOURCE_THING}",
+							"WITH", "MATERIALS", "FROM", "{SOURCE_STEP}"}},
+						ExpectedProducts: [][]string{{"CREATE", "{NEW_THING}"}},
+					},
+					ExpectedCommand: []string{"{EDITOR}"},
+				},
+			},
+		}
+	}
+
+	// Values that must be accepted by domain specific validation
+	validDictionaries := []map[string]string{
+		// Slashes and dots are legitimate in artifact rule patterns
+		{"SOURCE_THING": "dir/file.txt"},
+		// Brackets are legitimate in file names
+		{"SOURCE_THING": "foo[1].txt"},
+		// Spaces are legitimate in file names and cannot rewrite the
+		// tokenized rule structure
+		{"SOURCE_THING": "foo bar.txt"},
+		// Spaces and wildcards are allowed in command values
+		{"EDITOR": "vim -u NONE"},
+		{"EDITOR": "*"},
+		// Arbitrary paths, including absolute ones and paths with spaces,
+		// are allowed as the program of an executed command
+		{"UNTAR": "/usr/bin/tar"},
+		{"UNTAR": "/opt/my tools/tar"},
+	}
+	for _, dictionary := range validDictionaries {
+		if _, err := SubstituteParameters(makeLayout(), dictionary); err != nil {
+			t.Errorf("parameter substitution rejected valid value %s: %s",
+				dictionary, err)
+		}
+	}
+
+	// Values that must be rejected by domain specific validation
+	invalidDictionaries := []map[string]string{
+		// Wildcards in artifact rule patterns flatten rule specificity
+		{"SOURCE_THING": "*"},
+		{"SOURCE_THING": "foo?.txt"},
+		{"NEW_THING": "*"},
+		// Parent directory references survive path cleaning and match
+		// artifacts outside the intended prefix
+		{"SOURCE_THING": "../../etc/passwd"},
+		{"SOURCE_THING": "foo/.."},
+		// A substituted program of an executed command must not be empty
+		// or reference a parent directory
+		{"UNTAR": ""},
+		{"UNTAR": "../../evil"},
+	}
+	for _, dictionary := range invalidDictionaries {
+		if _, err := SubstituteParameters(makeLayout(), dictionary); err == nil {
+			t.Errorf("parameter substitution accepted invalid value %s",
+				dictionary)
+		}
+	}
+
+	// A substituted value must end up verbatim in the artifact rule
+	newLayout, err := SubstituteParameters(makeLayout(), map[string]string{
+		"SOURCE_THING": "dir/file.txt",
+	})
+	if err != nil {
+		t.Fatalf("parameter substitution error: got %s", err)
+	}
+	if newLayout.Steps[0].ExpectedMaterials[0][1] != "dir/file.txt" {
+		t.Errorf("parameter substitution failed - expected 'dir/file.txt', "+
+			"got %s", newLayout.Steps[0].ExpectedMaterials[0][1])
+	}
+}
+
 func TestInTotoVerifyWithDirectory(t *testing.T) {
 	layoutPath := "demo.layout"
 	pubKeyPath := "alice.pub"
