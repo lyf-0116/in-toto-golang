@@ -688,6 +688,41 @@ func TestVerifyMatchRule(t *testing.T) {
 			item:        map[string]Metadata{"foo": &Metablock{Signed: Link{Name: "foo", Materials: map[string]HashObj{"^.py": {"sha265": "abc"}, "r.py": {"sha265": "abc"}}}}},
 			expectSet:   NewSet("^.py", "r.py"),
 		},
+		{
+			name:        "Don't match empty hash objects (zero evidence must not consume)",
+			rule:        map[string]string{"pattern": "*", "dstName": "foo", "dstType": "materials"},
+			srcArtifact: map[string]HashObj{"foo.py": {}},
+			item:        map[string]Metadata{"foo": &Metablock{Signed: Link{Name: "foo", Materials: map[string]HashObj{"foo.py": {}}}}},
+			expectSet:   NewSet(),
+		},
+		{
+			name:        "Don't match when only the destination hash object is empty",
+			rule:        map[string]string{"pattern": "*", "dstName": "foo", "dstType": "materials"},
+			srcArtifact: map[string]HashObj{"foo.py": {"sha256": "abc"}},
+			item:        map[string]Metadata{"foo": &Metablock{Signed: Link{Name: "foo", Materials: map[string]HashObj{"foo.py": {}}}}},
+			expectSet:   NewSet(),
+		},
+		{
+			name:        "Match on any common algorithm with equal digest",
+			rule:        map[string]string{"pattern": "*", "dstName": "foo", "dstType": "materials"},
+			srcArtifact: map[string]HashObj{"foo.py": {"sha256": "abc", "sha512": "def"}},
+			item:        map[string]Metadata{"foo": &Metablock{Signed: Link{Name: "foo", Materials: map[string]HashObj{"foo.py": {"sha256": "abc", "sha384": "ghi"}}}}},
+			expectSet:   NewSet("foo.py"),
+		},
+		{
+			name:        "Don't match when shared algorithms report different digests",
+			rule:        map[string]string{"pattern": "*", "dstName": "foo", "dstType": "materials"},
+			srcArtifact: map[string]HashObj{"foo.py": {"sha256": "abc", "sha512": "def"}},
+			item:        map[string]Metadata{"foo": &Metablock{Signed: Link{Name: "foo", Materials: map[string]HashObj{"foo.py": {"sha256": "abc123", "sha384": "ghi"}}}}},
+			expectSet:   NewSet(),
+		},
+		{
+			name:        "Don't match uppercase digest against lowercase runtime digest",
+			rule:        map[string]string{"pattern": "*", "dstName": "foo", "dstType": "materials"},
+			srcArtifact: map[string]HashObj{"foo.py": {"sha256": "ABC"}},
+			item:        map[string]Metadata{"foo": &Metablock{Signed: Link{Name: "foo", Materials: map[string]HashObj{"foo.py": {"sha256": "abc"}}}}},
+			expectSet:   NewSet(),
+		},
 	}
 
 	for _, tt := range testCases {
@@ -1156,4 +1191,206 @@ func TestLoadLayoutCertificates(t *testing.T) {
 	testLayout.IntermediateCas[intermediateKey.KeyID] = intermediateKey
 	_, _, err = LoadLayoutCertificates(testLayout, [][]byte{[]byte("123123123")})
 	assert.NotNil(t, err, "expected error with invalid extra intermediates")
+}
+
+func TestHashObjsEqual(t *testing.T) {
+	var testCases = []struct {
+		name     string
+		src      HashObj
+		dst      HashObj
+		expected bool
+	}{
+		{
+			name:     "Two empty hash objects are not equal",
+			src:      HashObj{},
+			dst:      HashObj{},
+			expected: false,
+		},
+		{
+			name:     "Empty source hash object never matches",
+			src:      HashObj{},
+			dst:      HashObj{"sha256": "abc"},
+			expected: false,
+		},
+		{
+			name:     "Empty destination hash object never matches",
+			src:      HashObj{"sha256": "abc"},
+			dst:      HashObj{},
+			expected: false,
+		},
+		{
+			name:     "Equal single digest",
+			src:      HashObj{"sha256": "abc"},
+			dst:      HashObj{"sha256": "abc"},
+			expected: true,
+		},
+		{
+			name:     "Different digest for the same algorithm",
+			src:      HashObj{"sha256": "abc"},
+			dst:      HashObj{"sha256": "def"},
+			expected: false,
+		},
+		{
+			name:     "Match on a shared algorithm despite different algorithm sets",
+			src:      HashObj{"sha256": "abc", "sha512": "def"},
+			dst:      HashObj{"sha256": "abc", "sha384": "ghi"},
+			expected: true,
+		},
+		{
+			name:     "No shared algorithm",
+			src:      HashObj{"sha256": "abc"},
+			dst:      HashObj{"sha512": "abc"},
+			expected: false,
+		},
+		{
+			name:     "Uppercase digest does not match lowercase digest",
+			src:      HashObj{"sha256": "ABC"},
+			dst:      HashObj{"sha256": "abc"},
+			expected: false,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			if result := hashObjsEqual(tt.src, tt.dst); result != tt.expected {
+				t.Errorf("hashObjsEqual returned '%v', expected '%v'",
+					result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestValidateHashObj(t *testing.T) {
+	var testCases = []struct {
+		name         string
+		artifactName string
+		hashes       HashObj
+		expectErr    string
+	}{
+		{
+			name:         "Valid lowercase digests",
+			artifactName: "foo.py",
+			hashes:       HashObj{"sha256": "abc123", "sha512": "def456"},
+			expectErr:    "",
+		},
+		{
+			name:         "Empty hash object has no evidence",
+			artifactName: "foo.py",
+			hashes:       HashObj{},
+			expectErr:    "artifact 'foo.py' has no hashes",
+		},
+		{
+			name:         "Empty digest value is rejected",
+			artifactName: "foo.py",
+			hashes:       HashObj{"sha256": ""},
+			expectErr:    "empty sha256 digest",
+		},
+		{
+			name:         "Uppercase hex digits are rejected",
+			artifactName: "foo.py",
+			hashes:       HashObj{"sha256": "ABCDEF"},
+			expectErr:    "invalid sha256 digest",
+		},
+		{
+			name:         "Non-hex characters are rejected",
+			artifactName: "foo.py",
+			hashes:       HashObj{"sha256": "not-hex!"},
+			expectErr:    "invalid sha256 digest",
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateHashObj(tt.artifactName, tt.hashes)
+			if tt.expectErr == "" {
+				if err != nil {
+					t.Errorf("validateHashObj returned unexpected error: %s", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.expectErr) {
+				t.Errorf("validateHashObj returned '%s', expected error containing '%s'",
+					err, tt.expectErr)
+			}
+		})
+	}
+}
+
+func TestValidateLinkArtifacts(t *testing.T) {
+	validLink := func(materials, products map[string]HashObj) Metadata {
+		return &Metablock{
+			Signed: Link{
+				Name:      "foo",
+				Materials: materials,
+				Products:  products,
+			},
+		}
+	}
+
+	var testCases = []struct {
+		name      string
+		metadata  map[string]map[string]Metadata
+		expectErr string
+	}{
+		{
+			name: "Links with non-empty valid hashes pass",
+			metadata: map[string]map[string]Metadata{
+				"foo": {
+					"key-id": validLink(
+						map[string]HashObj{"foo.py": {"sha256": "abc"}},
+						map[string]HashObj{"bar.py": {"sha256": "def"}},
+					),
+				},
+			},
+			expectErr: "",
+		},
+		{
+			name: "Empty material hash object is rejected on the verification path",
+			metadata: map[string]map[string]Metadata{
+				"foo": {
+					"key-id": validLink(
+						map[string]HashObj{"foo.py": {}},
+						map[string]HashObj{"bar.py": {"sha256": "def"}},
+					),
+				},
+			},
+			expectErr: "invalid material",
+		},
+		{
+			name: "Empty product hash object is rejected on the verification path",
+			metadata: map[string]map[string]Metadata{
+				"foo": {
+					"key-id": validLink(
+						map[string]HashObj{"foo.py": {"sha256": "abc"}},
+						map[string]HashObj{"bar.py": {}},
+					),
+				},
+			},
+			expectErr: "invalid product",
+		},
+		{
+			name: "Uppercase digest is rejected on the verification path",
+			metadata: map[string]map[string]Metadata{
+				"foo": {
+					"key-id": validLink(
+						map[string]HashObj{"foo.py": {"sha256": "ABC"}},
+						map[string]HashObj{},
+					),
+				},
+			},
+			expectErr: "invalid material",
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateLinkArtifacts(tt.metadata)
+			if tt.expectErr == "" {
+				if err != nil {
+					t.Errorf("validateLinkArtifacts returned unexpected error: %s", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.expectErr) {
+				t.Errorf("validateLinkArtifacts returned '%s', expected error containing '%s'",
+					err, tt.expectErr)
+			}
+		})
+	}
 }

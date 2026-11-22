@@ -381,8 +381,8 @@ func TestValidateLink(t *testing.T) {
 		t.Errorf("invalid link metablock")
 	}
 	err = validateLink(testLink)
-	if err.Error() != "in materials of link 'test_material_hash': in artifact"+
-		" 'foo.py', sha256 hash value: invalid hex string: !@#$%" {
+	if err.Error() != "in materials of link 'test_material_hash': artifact"+
+		" 'foo.py' has an invalid sha256 digest: !@#$%" {
 		t.Error("validateLink error - invalid hashes not detected")
 	}
 
@@ -420,8 +420,8 @@ func TestValidateLink(t *testing.T) {
 		t.Errorf("invalid link metablock")
 	}
 	err = validateLink(testLink)
-	if err.Error() != "in products of link 'test_product_hash': in artifact "+
-		"'foo.tar.gz', sha256 hash value: invalid hex string: !@#$%" {
+	if err.Error() != "in products of link 'test_product_hash': artifact"+
+		" 'foo.tar.gz' has an invalid sha256 digest: !@#$%" {
 		t.Error("validateLink error - invalid hashes not detected")
 	}
 }

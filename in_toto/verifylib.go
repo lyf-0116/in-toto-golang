@@ -161,7 +161,7 @@ func verifyMatchRule(ruleData map[string]string,
 		}
 
 		// Ignore artifact pairs with no matching hashes
-		if !reflect.DeepEqual(srcArtifacts[srcPath], dstArtifact) {
+		if !hashObjsEqual(srcArtifacts[srcPath], dstArtifact) {
 			continue
 		}
 
@@ -253,7 +253,7 @@ func VerifyArtifacts(items []interface{},
 		remained := materialPaths.Intersection(productPaths)
 		modified := NewSet()
 		for name := range remained {
-			if !reflect.DeepEqual(materials[name], products[name]) {
+			if !hashObjsEqual(materials[name], products[name]) {
 				modified.Add(name)
 			}
 		}
@@ -511,6 +511,38 @@ func LoadLayoutCertificates(layout Layout, intermediatePems [][]byte) (*x509.Cer
 }
 
 /*
+validateLinkArtifacts checks that the materials and products reported by all
+passed link metadata objects carry usable hash evidence. Each reported
+artifact must have at least one hash, and every digest must be a non-empty
+lowercase hexadecimal string. This rejects links that only declare artifact
+paths with empty hash objects, which would otherwise satisfy MATCH rules
+without providing any evidence.
+*/
+func validateLinkArtifacts(stepsMetadata map[string]map[string]Metadata) error {
+	for stepName, linksPerStep := range stepsMetadata {
+		for keyID, linkEnv := range linksPerStep {
+			link, ok := linkEnv.GetPayload().(Link)
+			if !ok {
+				continue
+			}
+			for artifactName, hashes := range link.Materials {
+				if err := validateHashObj(artifactName, hashes); err != nil {
+					return fmt.Errorf("invalid material reported by link of"+
+						" step '%s' (signed by '%s'): %w", stepName, keyID, err)
+				}
+			}
+			for artifactName, hashes := range link.Products {
+				if err := validateHashObj(artifactName, hashes); err != nil {
+					return fmt.Errorf("invalid product reported by link of"+
+						" step '%s' (signed by '%s'): %w", stepName, keyID, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+/*
 VerifyLinkSignatureThesholds verifies that for each step of the passed layout,
 there are at least Threshold links, validly signed by different authorized
 functionaries.  The returned map of link metadata per steps contains only
@@ -616,6 +648,13 @@ func VerifyLinkSignatureThesholds(layout Layout,
 				" authorized signer: %v", step.Name, step.Threshold,
 				len(linksPerStepVerified), len(linksPerStep), stepErr)
 		}
+	}
+
+	// All links passed signature verification, now make sure their reported
+	// materials and products carry non-empty, validly encoded hash evidence,
+	// so that MATCH rules cannot be satisfied by empty hash objects.
+	if err := validateLinkArtifacts(stepsMetadataVerified); err != nil {
+		return nil, err
 	}
 	return stepsMetadataVerified, nil
 }

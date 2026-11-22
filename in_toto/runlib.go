@@ -513,17 +513,7 @@ func InTotoMatchProducts(link *Link, paths []string, hashAlgorithms []string, ex
 	inBothSet := artifactsSet.Intersection(productsSet)
 	differ := []string{}
 	for name := range inBothSet {
-		linkHashes := HashObj{}
-		for alg, val := range link.Products[name] {
-			linkHashes[alg] = val
-		}
-
-		artifactHashes := HashObj{}
-		for alg, val := range artifacts[name] {
-			artifactHashes[alg] = val
-		}
-
-		if !reflect.DeepEqual(linkHashes, artifactHashes) {
+		if !hashObjsEqual(link.Products[name], artifacts[name]) {
 			differ = append(differ, name)
 		}
 	}
