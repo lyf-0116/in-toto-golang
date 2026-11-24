@@ -549,6 +549,8 @@ func VerifyLinkSignatureThesholds(layout Layout,
 		// This will store links with valid signature from an authorized
 		// functionary for the given step
 		linksPerStepVerified := make(map[string]Metadata)
+		seenKeyIDs := make(map[string]struct{})
+		seenPublicKeyFingerprints := make(map[string]struct{})
 
 		// Check if there are any links at all for the given step
 		linksPerStep, ok := stepsMetadata[step.Name]
@@ -556,53 +558,35 @@ func VerifyLinkSignatureThesholds(layout Layout,
 			stepErr = fmt.Errorf("no links found")
 		}
 
-		// For each link corresponding to a step, check that the signer key was
-		// authorized, the layout contains a verification key and the signature
-		// verification passes.  Only good links are stored, to verify thresholds
-		// below.
-		isAuthorizedSignature := false
+		// For each outer metadata wrapper, find an authorized key or trusted
+		// certificate that verifies it. A signer is recorded only once, even if
+		// the same key appears under multiple identifiers or the same signature
+		// is supplied in multiple wrappers.
 		for signerKeyID, linkEnv := range linksPerStep {
-			for _, authorizedKeyID := range step.PubKeys {
-				if signerKeyID == authorizedKeyID {
-					if verifierKey, ok := layout.Keys[authorizedKeyID]; ok {
-						if err := linkEnv.VerifySignature(verifierKey); err == nil {
-							linksPerStepVerified[signerKeyID] = linkEnv
-							isAuthorizedSignature = true
-							break
-						}
-					}
-				}
+			authorizedKeyID, verifierKey, authorizedErr := verifyLinkWithLayoutKey(
+				linkEnv, signerKeyID, step, layout)
+
+			if authorizedErr == nil {
+				rememberVerifiedSigner(linksPerStepVerified, seenKeyIDs,
+					seenPublicKeyFingerprints, authorizedKeyID, linkEnv,
+					verifierKey)
+				continue
 			}
 
-			// If the signer's key wasn't in our step's pubkeys array, check the cert pool to
-			// see if the key is known to us.
-			if !isAuthorizedSignature {
-				sig, err := linkEnv.GetSignatureForKeyID(signerKeyID)
-				if err != nil {
-					stepErr = err
-					continue
-				}
+			certKey, certErr := verifyLinkWithCertificate(linkEnv,
+				signerKeyID, step, layout, rootCertPool, intermediateCertPool)
+			if certErr != nil {
+				stepErr = errors.Join(authorizedErr, certErr)
+				continue
+			}
 
-				cert, err := sig.GetCertificate()
-				if err != nil {
-					stepErr = err
-					continue
-				}
-
-				// test certificate against the step's constraints to make sure it's a valid functionary
-				err = step.CheckCertConstraints(cert, layout.RootCAIDs(), rootCertPool, intermediateCertPool)
-				if err != nil {
-					stepErr = err
-					continue
-				}
-
-				err = linkEnv.VerifySignature(cert)
-				if err != nil {
-					stepErr = err
-					continue
-				}
-
-				linksPerStepVerified[signerKeyID] = linkEnv
+			certSignerID := certKey.KeyID
+			if certSignerID == "" {
+				certSignerID = signerKeyID
+			}
+			if rememberVerifiedSigner(linksPerStepVerified, seenKeyIDs,
+				seenPublicKeyFingerprints, certSignerID, linkEnv, certKey) {
+				continue
 			}
 		}
 
@@ -618,6 +602,176 @@ func VerifyLinkSignatureThesholds(layout Layout,
 		}
 	}
 	return stepsMetadataVerified, nil
+}
+
+func rememberVerifiedSigner(verifiedLinks map[string]Metadata,
+	seenKeyIDs, seenPublicKeyFingerprints map[string]struct{},
+	preferredID string, linkEnv Metadata, key Key) bool {
+	fingerprint, fingerprintErr := PublicKeyFingerprint(key)
+	signerIDs := make([]string, 0, 2)
+	if key.KeyID != "" {
+		signerIDs = append(signerIDs, key.KeyID)
+	}
+	if preferredID != "" && preferredID != key.KeyID {
+		signerIDs = append(signerIDs, preferredID)
+	}
+
+	if fingerprintErr == nil {
+		if _, seen := seenPublicKeyFingerprints[fingerprint]; seen {
+			return false
+		}
+	}
+	for _, signerID := range signerIDs {
+		if _, seen := seenKeyIDs[signerID]; seen {
+			return false
+		}
+	}
+
+	if fingerprintErr == nil {
+		seenPublicKeyFingerprints[fingerprint] = struct{}{}
+	}
+	for _, signerID := range signerIDs {
+		seenKeyIDs[signerID] = struct{}{}
+	}
+
+	outputID := preferredID
+	if outputID == "" && len(signerIDs) > 0 {
+		outputID = signerIDs[0]
+	}
+	if outputID != "" {
+		verifiedLinks[outputID] = linkEnv
+	} else if fingerprintErr == nil {
+		verifiedLinks[fingerprint] = linkEnv
+	}
+
+	return true
+}
+
+func verifyLinkWithLayoutKey(linkEnv Metadata, wrapperKeyID string,
+	step Step, layout Layout) (string, Key, error) {
+	var verificationErrs []error
+	tried := make(map[string]struct{})
+
+	if len(step.PubKeys) == 0 {
+		return "", Key{}, errors.New("step has no authorized layout public keys")
+	}
+
+	tryKey := func(authorizedKeyID string) bool {
+		if _, ok := tried[authorizedKeyID]; ok {
+			return false
+		}
+		tried[authorizedKeyID] = struct{}{}
+
+		verifierKey, ok := layout.Keys[authorizedKeyID]
+		if !ok {
+			verificationErrs = append(verificationErrs,
+				fmt.Errorf("no layout key found for authorized key ID %q", authorizedKeyID))
+			return false
+		}
+
+		if err := verifyMetadataWithKey(linkEnv, verifierKey); err != nil {
+			verificationErrs = append(verificationErrs, err)
+			return false
+		}
+
+		return true
+	}
+
+	if wrapperKeyID != "" {
+		for _, authorizedKeyID := range step.PubKeys {
+			if authorizedKeyID == wrapperKeyID && tryKey(authorizedKeyID) {
+				key := layout.Keys[authorizedKeyID]
+				return authorizedKeyID, key, nil
+			}
+		}
+	}
+
+	for _, authorizedKeyID := range step.PubKeys {
+		if tryKey(authorizedKeyID) {
+			key := layout.Keys[authorizedKeyID]
+			return authorizedKeyID, key, nil
+		}
+	}
+
+	verificationErr := errors.Join(verificationErrs...)
+	if verificationErr == nil {
+		verificationErr = errors.New("no authorized layout key verified the metadata")
+	}
+	return "", Key{}, verificationErr
+}
+
+func verifyMetadataWithKey(metadata Metadata, key Key) error {
+	if err := metadata.VerifySignature(key); err == nil {
+		return nil
+	} else {
+		verificationErrs := []error{err}
+		for _, signature := range metadata.Sigs() {
+			candidateKey := key
+			candidateKey.KeyID = signature.KeyID
+			if err := metadata.VerifySignature(candidateKey); err == nil {
+				return nil
+			} else {
+				verificationErrs = append(verificationErrs, err)
+			}
+		}
+
+		return errors.Join(verificationErrs...)
+	}
+}
+
+func verifyLinkWithCertificate(linkEnv Metadata, preferredKeyID string,
+	step Step, layout Layout, rootCertPool, intermediateCertPool *x509.CertPool) (Key, error) {
+	var verificationErrs []error
+
+	verifySignatureWithCertificate := func(signature Signature) (Key, error) {
+		certKey, err := signature.GetCertificate()
+		if err != nil {
+			return Key{}, err
+		}
+
+		if err := step.CheckCertConstraints(certKey, layout.RootCAIDs(),
+			rootCertPool, intermediateCertPool); err != nil {
+			return Key{}, err
+		}
+
+		verifierCert := certKey
+		verifierCert.KeyID = signature.KeyID
+		if err := linkEnv.VerifySignature(verifierCert); err != nil {
+			return Key{}, err
+		}
+
+		return certKey, nil
+	}
+
+	if preferredKeyID != "" {
+		signature, err := linkEnv.GetSignatureForKeyID(preferredKeyID)
+		if err == nil {
+			if certKey, verifyErr := verifySignatureWithCertificate(signature); verifyErr == nil {
+				return certKey, nil
+			} else {
+				verificationErrs = append(verificationErrs, verifyErr)
+			}
+		} else {
+			verificationErrs = append(verificationErrs, err)
+		}
+	}
+
+	for _, signature := range linkEnv.Sigs() {
+		if signature.Certificate == "" {
+			continue
+		}
+		certKey, err := verifySignatureWithCertificate(signature)
+		if err == nil {
+			return certKey, nil
+		}
+		verificationErrs = append(verificationErrs, err)
+	}
+
+	verificationErr := errors.Join(verificationErrs...)
+	if verificationErr == nil {
+		verificationErr = errors.New("no certificate signature verified the metadata")
+	}
+	return Key{}, verificationErr
 }
 
 /*
