@@ -576,6 +576,31 @@ ISO 8601 standard.
 */
 const ISO8601DateSchema = "2006-01-02T15:04:05Z"
 
+var expiresFormatPattern = regexp.MustCompile(
+	`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$`,
+)
+
+// ParseExpires parses the signed layout expiration timestamp using the exact
+// format required by ISO8601DateSchema. It rejects values that time.Parse may
+// accept as an extension, such as fractional seconds, so the signed string has
+// one unambiguous timestamp interpretation.
+func ParseExpires(expires string) (time.Time, error) {
+	parsed, err := time.Parse(ISO8601DateSchema, expires)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	if !expiresFormatPattern.MatchString(expires) ||
+		parsed.Format(ISO8601DateSchema) != expires {
+		return time.Time{}, fmt.Errorf(
+			"expiry time %q does not match required format %q",
+			expires, ISO8601DateSchema,
+		)
+	}
+
+	return parsed.UTC(), nil
+}
+
 /*
 Layout represents the definition of a software supply chain.  It lists the
 sequence of steps required in the software supply chain and the functionaries
@@ -648,7 +673,7 @@ func validateLayout(layout Layout) error {
 		return fmt.Errorf("invalid Type value for layout: should be 'layout'")
 	}
 
-	if _, err := time.Parse(ISO8601DateSchema, layout.Expires); err != nil {
+	if _, err := ParseExpires(layout.Expires); err != nil {
 		return fmt.Errorf("expiry time parsed incorrectly - date either" +
 			" invalid or of incorrect format")
 	}
